@@ -67,12 +67,17 @@ async def redact(
                     rect.x1 + RECT_PADDING,
                     rect.y1 + RECT_PADDING,
                 )
-                page.add_redact_annot(padded, fill=(0, 0, 0))
+                # fill=False -> no box is drawn; only the text is removed.
+                page.add_redact_annot(padded, fill=False)
                 page_hits += 1
         if page_hits:
-            # Truly removes the underlying text/images inside the boxes,
-            # not just paints over them.
-            page.apply_redactions()
+            # Remove ONLY the text glyphs, leaving the page background
+            # (white space, colored banners, images) untouched -> the
+            # redacted area blends in instead of showing a black bar.
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            )
         total_hits += page_hits
 
     # garbage=4 purges the now-unreferenced content so the original data
