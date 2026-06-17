@@ -25,7 +25,7 @@ ICON_PATH = os.getenv("BEHUM_ICON", os.path.join(BASE, "behum_icon.png"))
 LOGO_PATH = os.getenv("BEHUM_LOGO", os.path.join(BASE, "behum_logo.png"))
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
-LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.55"))     # fraction of page width
+LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.90"))     # fraction of page width
 
 app = FastAPI(title="CV Redactor", version="3.0.0")
 
