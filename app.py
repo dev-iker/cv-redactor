@@ -83,4 +83,8 @@ async def redact(
     # IMPORTANT: log counts only, never the PII values themselves.
     log.info("redacted %d occurrences across %d terms", total_hits, len(term_list))
 
-    return Response(content=out, media_type="application/pdf")
+    return Response(
+        content=out,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="cv_ciego.pdf"'},
+    )
