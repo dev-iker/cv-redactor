@@ -15,7 +15,9 @@ log = logging.getLogger("cv-redactor")
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 API_KEY = os.getenv("REDACT_API_KEY")
-RECT_PADDING = float(os.getenv("REDACT_PADDING", "2"))
+# Vertical inset (fraction of each match's height) applied to redaction boxes so
+# they stay within the target line and never bleed into the line above/below.
+REDACT_VINSET = float(os.getenv("REDACT_VINSET", "0.25"))
 # Images covering >= this fraction of the page are treated as full-page
 # backgrounds and left untouched (so we don't wipe a CV's whole design).
 BG_COVERAGE_SKIP = float(os.getenv("REDACT_BG_COVERAGE_SKIP", "0.85"))
@@ -25,7 +27,7 @@ ICON_PATH = os.getenv("BEHUM_ICON", os.path.join(BASE, "behum_icon.png"))
 LOGO_PATH = os.getenv("BEHUM_LOGO", os.path.join(BASE, "behum_logo.png"))
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
-LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.90"))     # fraction of page width
+LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.55"))     # fraction of page width
 
 app = FastAPI(title="CV Redactor", version="3.0.0")
 
@@ -196,11 +198,9 @@ async def redact(
         page_hits = 0
         for term in term_list:
             for rect in page.search_for(term):
-                padded = fitz.Rect(
-                    rect.x0 - RECT_PADDING, rect.y0 - RECT_PADDING,
-                    rect.x1 + RECT_PADDING, rect.y1 + RECT_PADDING,
-                )
-                page.add_redact_annot(padded, fill=False)
+                inset = REDACT_VINSET * (rect.y1 - rect.y0)
+                red = fitz.Rect(rect.x0, rect.y0 + inset, rect.x1, rect.y1 - inset)
+                page.add_redact_annot(red, fill=False)
                 page_hits += 1
         if page_hits:
             page.apply_redactions(
