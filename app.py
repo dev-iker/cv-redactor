@@ -32,24 +32,27 @@ ICON_PATH = os.getenv("BEHUM_ICON", os.path.join(BASE, "behum_icon.png"))
 LOGO_PATH = os.getenv("BEHUM_LOGO", os.path.join(BASE, "behum_logo.png"))
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
-LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.55"))     # fraction of page width
+LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.62"))     # fraction of page width
 
 app = FastAPI(title="CV Redactor", version="3.0.0")
 
 
 def _load_keyed_png(path, opacity=1.0):
-    """Load a logo, turn its (black) background transparent by deriving alpha
-    from brightness, and optionally scale the alpha to make it faint."""
+    """Turn the (black) background transparent and recolor the artwork to its
+    own brand color, so anti-aliased edges keep no dark halo."""
     im = Image.open(path).convert("RGB")
     r, g, b = im.split()
-    alpha = ImageChops.lighter(ImageChops.lighter(r, g), b)  # max channel
+    alpha = ImageChops.lighter(ImageChops.lighter(r, g), b)  # brightness -> alpha
+    colors = im.getcolors(maxcolors=16777216) or []
+    bright = [(cnt, col) for cnt, col in colors if max(col) > 150]
+    brand = max(bright, key=lambda t: t[0])[1] if bright else (245, 190, 0)
     if opacity < 1.0:
         alpha = alpha.point(lambda v: int(v * opacity))
-    im = im.convert("RGBA")
-    im.putalpha(alpha)
+    solid = Image.new("RGBA", im.size, brand + (255,))
+    solid.putalpha(alpha)
     buf = io.BytesIO()
-    im.save(buf, "PNG")
-    return buf.getvalue(), im.size
+    solid.save(buf, "PNG")
+    return buf.getvalue(), solid.size
 
 
 # Pre-build branding assets once at startup (graceful if files are missing).
@@ -141,11 +144,12 @@ def _add_branding(page):
     if _LOGO_PNG:
         lw, lh = _LOGO_SIZE
         blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
-        margin = 16
+        margin = 8
+        gap = 4
         band_x0 = 0.45 * W
         right_text = [b for b in blocks if b[2] > band_x0]
         top_y = min((b[1] for b in right_text), default=0.30 * H)
-        clear_h = max(top_y - margin - 6, 0)
+        clear_h = max(top_y - margin - gap, 0)
         logo_w = LOGO_MAX_WIDTH * W
         logo_h = logo_w * lh / lw
         if logo_h > clear_h and clear_h > 20:   # fit within the clear zone
