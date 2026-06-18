@@ -2,6 +2,7 @@ import os
 import io
 import json
 import logging
+import re
 from collections import Counter
 
 import fitz  # PyMuPDF
@@ -18,6 +19,10 @@ API_KEY = os.getenv("REDACT_API_KEY")
 # Vertical inset (fraction of each match's height) applied to redaction boxes so
 # they stay within the target line and never bleed into the line above/below.
 REDACT_VINSET = float(os.getenv("REDACT_VINSET", "0.25"))
+# A whole line is removed (e.g. "email | phone | linkedin") only when, after
+# removing the PII values, nothing but these filler chars remains. This clears
+# leftover separators on contact lines without touching legit pipes elsewhere.
+_FILLER = re.compile(r"[\s|·•—–/,.:;\-]+")
 # Images covering >= this fraction of the page are treated as full-page
 # backgrounds and left untouched (so we don't wipe a CV's whole design).
 BG_COVERAGE_SKIP = float(os.getenv("REDACT_BG_COVERAGE_SKIP", "0.85"))
@@ -156,6 +161,25 @@ def _add_branding(page):
         )
 
 
+def _redaction_rects(page, term_list):
+    """Rects to redact: each PII match, plus the full bbox of any line that is
+    entirely PII + separators (so leftover '|' etc. on contact lines go too)."""
+    rects = []
+    for term in term_list:
+        rects.extend(page.search_for(term))
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            text = "".join(s["text"] for s in line["spans"])
+            if not any(t in text for t in term_list):
+                continue
+            residual = text
+            for t in term_list:
+                residual = residual.replace(t, "")
+            if _FILLER.sub("", residual) == "":
+                rects.append(fitz.Rect(line["bbox"]))
+    return rects
+
+
 @app.post("/redact")
 async def redact(
     file: UploadFile = File(...),
@@ -195,19 +219,18 @@ async def redact(
         if do_images:
             total_imgs += _remove_images(page)
         # 2) remove PII text (no box; only the glyphs are deleted)
-        page_hits = 0
-        for term in term_list:
-            for rect in page.search_for(term):
-                inset = REDACT_VINSET * (rect.y1 - rect.y0)
-                red = fitz.Rect(rect.x0, rect.y0 + inset, rect.x1, rect.y1 - inset)
-                page.add_redact_annot(red, fill=False)
-                page_hits += 1
-        if page_hits:
+        red_rects = _redaction_rects(page, term_list)
+        for r in red_rects:
+            inset = REDACT_VINSET * (r.y1 - r.y0)
+            page.add_redact_annot(
+                fitz.Rect(r.x0, r.y0 + inset, r.x1, r.y1 - inset), fill=False
+            )
+        if red_rects:
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
             )
-        total_text += page_hits
+        total_text += len(red_rects)
         # 3) Behum branding (watermark + logo)
         if do_brand:
             _add_branding(page)
