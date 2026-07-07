@@ -26,6 +26,13 @@ _FILLER = re.compile(r"[\s|·•—–/,.:;\-]+")
 # Images covering >= this fraction of the page are treated as full-page
 # backgrounds and left untouched (so we don't wipe a CV's whole design).
 BG_COVERAGE_SKIP = float(os.getenv("REDACT_BG_COVERAGE_SKIP", "0.85"))
+# Thin horizontal strokes inside an already-redacted region are leftover
+# underlines (e.g. a redacted hyperlink). They are painted over with the
+# surrounding background color. Restricted to redacted zones so color panels
+# and legit rules/borders stay untouched.
+UNDERLINE_MIN_WIDTH = float(os.getenv("UNDERLINE_MIN_WIDTH", "15"))
+UNDERLINE_MAX_HEIGHT = float(os.getenv("UNDERLINE_MAX_HEIGHT", "3.5"))
+UNDERLINE_PROBE_PAD = float(os.getenv("UNDERLINE_PROBE_PAD", "3"))
 
 # --- Branding (Behum) ---
 ICON_PATH = os.getenv("BEHUM_ICON", os.path.join(BASE, "behum_icon.png"))
@@ -128,6 +135,32 @@ def _remove_images(page):
     return removed
 
 
+def _remove_underlines(page, red_rects, pm):
+    """Paint over thin horizontal strokes (link/text underlines) that fall in an
+    already-redacted region, using the surrounding background color. Restricted
+    to redacted zones, so color panels and legit rules stay untouched."""
+    if not red_rects:
+        return 0
+    removed = 0
+    for d in page.get_drawings():
+        r = d["rect"]
+        if r.width < UNDERLINE_MIN_WIDTH or r.height > UNDERLINE_MAX_HEIGHT:
+            continue
+        in_red = any(
+            fitz.Rect(rr.x0, rr.y0, rr.x1, rr.y1 + UNDERLINE_PROBE_PAD).intersects(r)
+            for rr in red_rects
+        )
+        if not in_red:
+            continue
+        color = tuple(c / 255 for c in _sample_color(page, pm, r))
+        page.draw_rect(
+            fitz.Rect(r.x0, r.y0 - 0.6, r.x1, r.y1 + 0.6),
+            color=color, fill=color, width=0,
+        )
+        removed += 1
+    return removed
+
+
 def _add_branding(page):
     """Centered faint 'B' watermark + full logo placed in the top clear zone."""
     W, H = page.rect.width, page.rect.height
@@ -218,6 +251,7 @@ async def redact(
 
     total_text = 0
     total_imgs = 0
+    total_lines = 0
     for page in doc:
         # 1) remove photo(s) without harming text
         if do_images:
@@ -234,6 +268,9 @@ async def redact(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
             )
+            # 2b) remove leftover underlines inside the redacted zones
+            pm_bg = page.get_pixmap(dpi=72)
+            total_lines += _remove_underlines(page, red_rects, pm_bg)
         total_text += len(red_rects)
         # 3) Behum branding (watermark + logo)
         if do_brand:
@@ -242,8 +279,8 @@ async def redact(
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     log.info(
-        "removed %d image(s); redacted %d text occurrence(s) across %d terms",
-        total_imgs, total_text, len(term_list),
+        "removed %d image(s); redacted %d text occurrence(s); cleared %d underline(s) across %d terms",
+        total_imgs, total_text, total_lines, len(term_list),
     )
     return Response(
         content=out,
