@@ -6,9 +6,15 @@ import re
 from collections import Counter
 
 import fitz  # PyMuPDF
+import numpy as np
 from PIL import Image, ImageChops
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import Response
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - opencv missing entirely
+    cv2 = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cv-redactor")
@@ -43,7 +49,38 @@ WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
 LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.62"))     # fraction of page width
 
-app = FastAPI(title="CV Redactor", version="3.1.0")
+# --- Nivel 2: face detection on image-based CVs (OpenCV YuNet, local/offline) ---
+# Runs entirely inside this container — no candidate photo is ever sent to a
+# third-party service. See _cover_faces_on_image for why.
+FACE_MODEL_PATH = os.getenv(
+    "FACE_MODEL_PATH", os.path.join(BASE, "face_detection_yunet_2023mar.onnx")
+)
+FACE_SCORE_THRESHOLD = float(os.getenv("FACE_SCORE_THRESHOLD", "0.6"))
+FACE_NMS_THRESHOLD = float(os.getenv("FACE_NMS_THRESHOLD", "0.3"))
+# CV photos are almost always in the header/top area of the page. Searching
+# that crop first is faster and more reliable than the full page (a small
+# face lost in a huge page image is much harder for the model to find). Falls
+# back to the full image if nothing turns up in the crop.
+FACE_TOP_CROP_FRACTION = float(os.getenv("FACE_TOP_CROP_FRACTION", "0.40"))
+# Margin added around each detected face box before covering it, as a
+# multiple of the box's own width/height. Deliberately generous: the
+# detector's box is a close-but-imperfect fit (confirmed on a real CV), and
+# missing a sliver of face is a privacy leak while covering extra hair/
+# background is not. Asymmetric vertically because hair/forehead needs less
+# room than chin/neckline in most ID-style photos.
+FACE_MARGIN_X = float(os.getenv("FACE_MARGIN_X", "1.15"))
+FACE_MARGIN_TOP = float(os.getenv("FACE_MARGIN_TOP", "1.2"))
+FACE_MARGIN_BOTTOM = float(os.getenv("FACE_MARGIN_BOTTOM", "1.3"))
+FACE_COVER_COLOR = (0.25, 0.28, 0.32)  # neutral slate; reads as a deliberate redaction
+# Until this is proven reliable on enough real CVs, keep the Nivel 0 "revisar
+# a mano" warning ON even when a face was found and covered. Flip to true
+# once you trust it — then the warning only stays on for pages where NO face
+# was found at all (i.e. a possible miss).
+TRUST_FACE_DETECTION = os.getenv("TRUST_FACE_DETECTION", "false").lower() in (
+    "1", "true", "yes", "on",
+)
+
+app = FastAPI(title="CV Redactor", version="3.2.0")
 
 
 def _load_keyed_png(path, opacity=1.0):
@@ -77,9 +114,47 @@ except Exception as e:
     log.warning("logo not loaded (%s): %s", LOGO_PATH, e)
 
 
+# Lazily-created singleton: the model is loaded once per process, not per
+# request. If the model file is missing or unreadable, face-covering is
+# disabled but the rest of the service (Nivel 0 + Nivel 1) keeps working —
+# same graceful-degradation pattern as the branding assets above.
+_face_detector = None
+_face_detector_load_attempted = False
+
+
+def _get_face_detector():
+    global _face_detector, _face_detector_load_attempted
+    if _face_detector_load_attempted:
+        return _face_detector
+    _face_detector_load_attempted = True
+    if cv2 is None:
+        log.warning("opencv not installed - face covering (Nivel 2) disabled")
+        return None
+    if not os.path.exists(FACE_MODEL_PATH):
+        log.warning(
+            "face model not found at %s - face covering (Nivel 2) disabled",
+            FACE_MODEL_PATH,
+        )
+        return None
+    try:
+        _face_detector = cv2.FaceDetectorYN_create(
+            FACE_MODEL_PATH, "", (320, 320),
+            score_threshold=FACE_SCORE_THRESHOLD,
+            nms_threshold=FACE_NMS_THRESHOLD,
+        )
+    except Exception as e:
+        log.warning("could not load face model (%s): %s", FACE_MODEL_PATH, e)
+        _face_detector = None
+    return _face_detector
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "branding": bool(_WM_PNG and _LOGO_PNG)}
+    return {
+        "status": "ok",
+        "branding": bool(_WM_PNG and _LOGO_PNG),
+        "face_detection": _get_face_detector() is not None,
+    }
 
 
 def _sample_color(page, pm, rect, margin=8, step=8):
@@ -102,31 +177,34 @@ def _remove_images(page, apply_removal=True):
     the photo area with the surrounding background color. Skips full-page
     backgrounds and never fills over text below the image.
 
-    Returns (removed_count, has_bg_image): has_bg_image is True when this
-    page contains an image covering >= BG_COVERAGE_SKIP of the page — i.e.
-    the CV is effectively a full-page photo/scan with an OCR text layer on
-    top (see /redact for how that case is handled: PII text is painted over
-    via _cover_pii_on_image instead of deleting the image).
+    Returns (removed_count, bg_images): bg_images is a list of (xref, rect)
+    for every image covering >= BG_COVERAGE_SKIP of the page — i.e. the CV is
+    effectively a full-page photo/scan with an OCR text layer on top (see
+    /redact for how that case is handled: PII text is painted over via
+    _cover_pii_on_image, and any face in it via _cover_faces_on_image, instead
+    of deleting the image). Truthiness of bg_images works as the old
+    has_bg_image boolean did.
 
-    apply_removal=False runs pure detection (has_bg_image) without touching
-    the page, so callers can still raise the Nivel 0 warning even when the
-    caller disabled photo removal via the remove_images form field — the
-    RGPD safety net must not depend on that optional toggle.
+    apply_removal=False runs pure detection (bg_images) without touching the
+    page, so callers can still raise the Nivel 0 warning even when the caller
+    disabled photo removal via the remove_images form field — the RGPD safety
+    net must not depend on that optional toggle.
     """
     imgs = page.get_images(full=True)
     if not imgs:
-        return 0, False
+        return 0, []
     page_area = page.rect.get_area()
     if page_area <= 0:
-        return 0, False
+        return 0, []
     pm = page.get_pixmap(dpi=72)  # original colors for sampling
     blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
     removed = 0
-    has_bg_image = False
+    bg_images = []
     for img in imgs:
         xref = img[0]
         rects = page.get_image_rects(xref)
         is_bg = False
+        bg_rect = None
         usable = []
         for r in rects:
             vis = r & page.rect
@@ -134,10 +212,11 @@ def _remove_images(page, apply_removal=True):
                 continue
             if vis.get_area() / page_area >= BG_COVERAGE_SKIP:
                 is_bg = True
+                bg_rect = vis
                 break
             usable.append(r)
         if is_bg:
-            has_bg_image = True
+            bg_images.append((xref, bg_rect))
             continue
         if not usable or not apply_removal:
             continue
@@ -150,7 +229,7 @@ def _remove_images(page, apply_removal=True):
             if fr.get_area() > 0:
                 page.draw_rect(fr, color=color, fill=color, width=0)
         removed += 1
-    return removed, has_bg_image
+    return removed, bg_images
 
 
 def _remove_underlines(page, red_rects, pm):
@@ -196,9 +275,8 @@ def _cover_pii_on_image(page, red_rects, pm):
     capped well under half the tightest line gap seen in real CVs (~2.6pt), so
     it never bleeds into the line above/below.
 
-    This does NOT remove a face/photo embedded in the image — that requires
-    face detection (a separate, not-yet-implemented step, "Nivel 2"). Callers
-    should treat pages where this ran as still needing manual photo review.
+    This does NOT remove a face/photo embedded in the image — that's handled
+    separately by _cover_faces_on_image ("Nivel 2").
     """
     covered = 0
     for r in red_rects:
@@ -210,6 +288,78 @@ def _cover_pii_on_image(page, red_rects, pm):
         color = tuple(c / 255 for c in _sample_color(page, pm, rr))
         page.draw_rect(rr, color=color, fill=color, width=0)
         covered += 1
+    return covered
+
+
+def _detect_faces_px(bgr_image):
+    """Run the YuNet face detector on a BGR uint8 numpy image. Returns a list
+    of (x, y, w, h) pixel boxes (top-left corner + size), one per detected
+    face, already filtered by FACE_SCORE_THRESHOLD/FACE_NMS_THRESHOLD."""
+    detector = _get_face_detector()
+    if detector is None:
+        return []
+    h, w = bgr_image.shape[:2]
+    if h <= 0 or w <= 0:
+        return []
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(bgr_image)
+    if faces is None:
+        return []
+    return [(float(f[0]), float(f[1]), float(f[2]), float(f[3])) for f in faces]
+
+
+def _cover_faces_on_image(page, xref, img_rect):
+    """Nivel 2: find and cover any face baked into a full-page background
+    image (see bg_images from _remove_images). Runs 100% locally in this
+    container via OpenCV/YuNet - the candidate's photo is never sent to a
+    third-party service, which would otherwise make that provider a new data
+    processor of the candidate's personal data.
+
+    Returns the number of faces covered on this page.
+    """
+    detector = _get_face_detector()
+    if detector is None:
+        return 0
+    doc = page.parent
+    try:
+        base = doc.extract_image(xref)
+        img_bytes = base["image"]
+    except Exception as e:
+        log.warning("could not extract background image (xref %s): %s", xref, e)
+        return 0
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return 0
+    img_h, img_w = bgr.shape[:2]
+    if img_h <= 0 or img_w <= 0:
+        return 0
+
+    crop_h = max(1, int(img_h * FACE_TOP_CROP_FRACTION))
+    boxes = _detect_faces_px(bgr[:crop_h, :, :])
+    if not boxes:
+        boxes = _detect_faces_px(bgr)  # fallback: search the whole image
+    if not boxes:
+        return 0
+
+    sx = img_rect.width / img_w
+    sy = img_rect.height / img_h
+    covered = 0
+    for (x, y, w, h) in boxes:
+        fx0 = img_rect.x0 + x * sx
+        fy0 = img_rect.y0 + y * sy
+        fx1 = fx0 + w * sx
+        fy1 = fy0 + h * sy
+        fw, fh = fx1 - fx0, fy1 - fy0
+        cx, cy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
+        half_w = fw * FACE_MARGIN_X
+        half_h_top = fh * FACE_MARGIN_TOP
+        half_h_bot = fh * FACE_MARGIN_BOTTOM
+        cover = fitz.Rect(cx - half_w, cy - half_h_top, cx + half_w, cy + half_h_bot)
+        cover &= page.rect  # never draw outside the page
+        if cover.get_area() > 0:
+            page.draw_rect(cover, color=FACE_COVER_COLOR, fill=FACE_COVER_COLOR, width=0)
+            covered += 1
     return covered
 
 
@@ -275,6 +425,7 @@ async def redact(
     terms: str = Form(...),
     remove_images: str = Form("true"),
     add_branding: str = Form("true"),
+    cover_faces: str = Form("true"),
     x_api_key: str | None = Header(default=None),
 ):
     if API_KEY and x_api_key != API_KEY:
@@ -300,19 +451,23 @@ async def redact(
 
     do_images = str(remove_images).lower() in ("1", "true", "yes", "on")
     do_brand = str(add_branding).lower() in ("1", "true", "yes", "on")
+    do_faces = str(cover_faces).lower() in ("1", "true", "yes", "on")
 
     total_text = 0
     total_imgs = 0
     total_lines = 0
     total_covered = 0
+    total_faces = 0
     image_based_pages = []
+    pages_without_face = []  # image-based pages where 0 faces were found/covered
     for page_idx, page in enumerate(doc):
         # 1) remove photo(s) without harming text; detect "image-based" CVs
         # (full-page background image + OCR text layer) regardless of the
         # remove_images flag, so the RGPD warning below always fires.
-        removed, has_bg_image = _remove_images(page, apply_removal=do_images)
+        removed, bg_images = _remove_images(page, apply_removal=do_images)
         if do_images:
             total_imgs += removed
+        has_bg_image = bool(bg_images)
         if has_bg_image:
             image_based_pages.append(page_idx + 1)
 
@@ -338,6 +493,17 @@ async def redact(
                 total_covered += _cover_pii_on_image(page, red_rects, pm_bg)
         total_text += len(red_rects)
 
+        # 2d) Nivel 2: cover any face baked into the background image itself.
+        if has_bg_image and do_faces:
+            faces_this_page = sum(
+                _cover_faces_on_image(page, xref, rect) for xref, rect in bg_images
+            )
+            total_faces += faces_this_page
+            if faces_this_page == 0:
+                pages_without_face.append(page_idx + 1)
+        elif has_bg_image:
+            pages_without_face.append(page_idx + 1)
+
         # 3) Behum branding (watermark + logo)
         if do_brand:
             _add_branding(page)
@@ -346,26 +512,36 @@ async def redact(
     doc.close()
     log.info(
         "removed %d image(s); redacted %d text occurrence(s); cleared %d underline(s); "
-        "covered %d PII region(s) over background image across %d terms",
-        total_imgs, total_text, total_lines, total_covered, len(term_list),
+        "covered %d PII region(s) and %d face(s) over background image(s) across %d terms",
+        total_imgs, total_text, total_lines, total_covered, total_faces, len(term_list),
     )
 
     # Nivel 0 (RGPD safety net): an "image-based" CV (full-page photo/scan +
-    # invisible OCR layer) still has its embedded photo visible after this —
-    # face removal (Nivel 2) is not implemented yet. Flag it clearly instead
-    # of silently shipping a CV that only *looks* anonymized: both in the
-    # response headers (for the calling workflow to branch on) and in the
-    # filename (so a human glancing at the file also sees it).
+    # invisible OCR layer) needs extra scrutiny. Nivel 2 now covers faces it
+    # finds automatically, but until that's proven reliable on enough real
+    # CVs (TRUST_FACE_DETECTION=false by default) we keep flagging every
+    # image-based CV for manual review regardless of what Nivel 2 did. Once
+    # trusted, the flag only stays on for pages where NO face was found at
+    # all (a possible miss) - never silently, always visible in both the
+    # response headers (for the calling workflow) and the filename (for a
+    # human glancing at the file).
     image_based = bool(image_based_pages)
+    if TRUST_FACE_DETECTION:
+        needs_review_pages = pages_without_face
+    else:
+        needs_review_pages = image_based_pages
+    needs_review = bool(needs_review_pages)
+
     if image_based:
         log.warning(
             "image-based CV detected on page(s) %s - scanned/photographed CV "
-            "(full-page image + OCR text layer). PII text was covered, but any "
-            "face/photo embedded in that image is NOT removed by this service "
-            "yet. Flag for manual photo review before sending to a client.",
-            image_based_pages,
+            "(full-page image + OCR text layer). PII text covered; %d face(s) "
+            "covered automatically; page(s) %s had no face covered. "
+            "needs_manual_review=%s (TRUST_FACE_DETECTION=%s)",
+            image_based_pages, total_faces, pages_without_face or "none",
+            needs_review, TRUST_FACE_DETECTION,
         )
-        filename = "cv_ciego_REVISAR_FOTO.pdf"
+        filename = "cv_ciego_REVISAR_FOTO.pdf" if needs_review else "cv_ciego.pdf"
     else:
         filename = "cv_ciego.pdf"
 
@@ -373,7 +549,9 @@ async def redact(
         "Content-Disposition": f'inline; filename="{filename}"',
         "X-Cv-Redactor-Image-Based": "true" if image_based else "false",
         "X-Cv-Redactor-Image-Pages": ",".join(str(p) for p in image_based_pages),
-        "X-Cv-Redactor-Needs-Manual-Photo-Review": "true" if image_based else "false",
+        "X-Cv-Redactor-Faces-Covered": str(total_faces),
+        "X-Cv-Redactor-Pages-Without-Face": ",".join(str(p) for p in pages_without_face),
+        "X-Cv-Redactor-Needs-Manual-Photo-Review": "true" if needs_review else "false",
     }
     return Response(
         content=out,
