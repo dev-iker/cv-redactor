@@ -24,7 +24,9 @@ REDACT_VINSET = float(os.getenv("REDACT_VINSET", "0.25"))
 # leftover separators on contact lines without touching legit pipes elsewhere.
 _FILLER = re.compile(r"[\s|·•—–/,.:;\-]+")
 # Images covering >= this fraction of the page are treated as full-page
-# backgrounds and left untouched (so we don't wipe a CV's whole design).
+# backgrounds (typically a scanned/photographed CV with an OCR text layer on
+# top) and are NOT deleted like a normal photo would be — see has_bg_image /
+# _cover_pii_on_image below for how their PII is handled instead.
 BG_COVERAGE_SKIP = float(os.getenv("REDACT_BG_COVERAGE_SKIP", "0.85"))
 # Thin horizontal strokes inside an already-redacted region are leftover
 # underlines (e.g. a redacted hyperlink). They are painted over with the
@@ -41,7 +43,7 @@ WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
 LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.62"))     # fraction of page width
 
-app = FastAPI(title="CV Redactor", version="3.0.0")
+app = FastAPI(title="CV Redactor", version="3.1.0")
 
 
 def _load_keyed_png(path, opacity=1.0):
@@ -95,19 +97,32 @@ def _sample_color(page, pm, rect, margin=8, step=8):
     return Counter(cols).most_common(1)[0][0] if cols else (255, 255, 255)
 
 
-def _remove_images(page):
+def _remove_images(page, apply_removal=True):
     """Remove raster images (photos) WITHOUT deleting nearby text, then fill
     the photo area with the surrounding background color. Skips full-page
-    backgrounds and never fills over text below the image."""
+    backgrounds and never fills over text below the image.
+
+    Returns (removed_count, has_bg_image): has_bg_image is True when this
+    page contains an image covering >= BG_COVERAGE_SKIP of the page — i.e.
+    the CV is effectively a full-page photo/scan with an OCR text layer on
+    top (see /redact for how that case is handled: PII text is painted over
+    via _cover_pii_on_image instead of deleting the image).
+
+    apply_removal=False runs pure detection (has_bg_image) without touching
+    the page, so callers can still raise the Nivel 0 warning even when the
+    caller disabled photo removal via the remove_images form field — the
+    RGPD safety net must not depend on that optional toggle.
+    """
     imgs = page.get_images(full=True)
     if not imgs:
-        return 0
+        return 0, False
     page_area = page.rect.get_area()
     if page_area <= 0:
-        return 0
+        return 0, False
     pm = page.get_pixmap(dpi=72)  # original colors for sampling
     blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
     removed = 0
+    has_bg_image = False
     for img in imgs:
         xref = img[0]
         rects = page.get_image_rects(xref)
@@ -121,7 +136,10 @@ def _remove_images(page):
                 is_bg = True
                 break
             usable.append(r)
-        if is_bg or not usable:
+        if is_bg:
+            has_bg_image = True
+            continue
+        if not usable or not apply_removal:
             continue
         page.delete_image(xref)  # removes image, keeps text
         for r in usable:
@@ -132,7 +150,7 @@ def _remove_images(page):
             if fr.get_area() > 0:
                 page.draw_rect(fr, color=color, fill=color, width=0)
         removed += 1
-    return removed
+    return removed, has_bg_image
 
 
 def _remove_underlines(page, red_rects, pm):
@@ -159,6 +177,40 @@ def _remove_underlines(page, red_rects, pm):
         )
         removed += 1
     return removed
+
+
+def _cover_pii_on_image(page, red_rects, pm):
+    """For 'image-based' CVs (a full-page photo/scan with an invisible OCR text
+    layer on top), apply_redactions() only deletes the invisible glyphs — the
+    PII pixels baked into the image itself are still visible underneath. Since
+    the OCR layer's bounding boxes line up with the visible text (search_for
+    already located it), paint over each PII rect with the sampled surrounding
+    color — same technique already used for photos and underlines.
+
+    The OCR bbox is a close but imperfect fit around the rendered glyphs (font
+    metric estimation, not pixel-perfect), so a tight box can leave a sliver of
+    the last character visible at the right edge. A small asymmetric pad
+    compensates: more padding on the right (where the mismatch was observed on
+    a real CV) than on the left (where padding would otherwise eat into the
+    preceding word's punctuation, e.g. "Nombre:"). Vertical pad stays small,
+    capped well under half the tightest line gap seen in real CVs (~2.6pt), so
+    it never bleeds into the line above/below.
+
+    This does NOT remove a face/photo embedded in the image — that requires
+    face detection (a separate, not-yet-implemented step, "Nivel 2"). Callers
+    should treat pages where this ran as still needing manual photo review.
+    """
+    covered = 0
+    for r in red_rects:
+        h = r.y1 - r.y0
+        pad_left = 1.5
+        pad_right = max(6.0, 0.7 * h)
+        pad_y = min(1.0, 0.15 * h)
+        rr = fitz.Rect(r.x0 - pad_left, r.y0 - pad_y, r.x1 + pad_right, r.y1 + pad_y)
+        color = tuple(c / 255 for c in _sample_color(page, pm, rr))
+        page.draw_rect(rr, color=color, fill=color, width=0)
+        covered += 1
+    return covered
 
 
 def _add_branding(page):
@@ -252,10 +304,18 @@ async def redact(
     total_text = 0
     total_imgs = 0
     total_lines = 0
-    for page in doc:
-        # 1) remove photo(s) without harming text
+    total_covered = 0
+    image_based_pages = []
+    for page_idx, page in enumerate(doc):
+        # 1) remove photo(s) without harming text; detect "image-based" CVs
+        # (full-page background image + OCR text layer) regardless of the
+        # remove_images flag, so the RGPD warning below always fires.
+        removed, has_bg_image = _remove_images(page, apply_removal=do_images)
         if do_images:
-            total_imgs += _remove_images(page)
+            total_imgs += removed
+        if has_bg_image:
+            image_based_pages.append(page_idx + 1)
+
         # 2) remove PII text (no box; only the glyphs are deleted)
         red_rects = _redaction_rects(page, term_list)
         for r in red_rects:
@@ -271,7 +331,13 @@ async def redact(
             # 2b) remove leftover underlines inside the redacted zones
             pm_bg = page.get_pixmap(dpi=72)
             total_lines += _remove_underlines(page, red_rects, pm_bg)
+            # 2c) image-based CV: the PII is also baked into the background
+            # image itself (apply_redactions only touched the invisible OCR
+            # text). Paint over it too, so the visible page doesn't leak PII.
+            if has_bg_image:
+                total_covered += _cover_pii_on_image(page, red_rects, pm_bg)
         total_text += len(red_rects)
+
         # 3) Behum branding (watermark + logo)
         if do_brand:
             _add_branding(page)
@@ -279,11 +345,38 @@ async def redact(
     out = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     log.info(
-        "removed %d image(s); redacted %d text occurrence(s); cleared %d underline(s) across %d terms",
-        total_imgs, total_text, total_lines, len(term_list),
+        "removed %d image(s); redacted %d text occurrence(s); cleared %d underline(s); "
+        "covered %d PII region(s) over background image across %d terms",
+        total_imgs, total_text, total_lines, total_covered, len(term_list),
     )
+
+    # Nivel 0 (RGPD safety net): an "image-based" CV (full-page photo/scan +
+    # invisible OCR layer) still has its embedded photo visible after this —
+    # face removal (Nivel 2) is not implemented yet. Flag it clearly instead
+    # of silently shipping a CV that only *looks* anonymized: both in the
+    # response headers (for the calling workflow to branch on) and in the
+    # filename (so a human glancing at the file also sees it).
+    image_based = bool(image_based_pages)
+    if image_based:
+        log.warning(
+            "image-based CV detected on page(s) %s - scanned/photographed CV "
+            "(full-page image + OCR text layer). PII text was covered, but any "
+            "face/photo embedded in that image is NOT removed by this service "
+            "yet. Flag for manual photo review before sending to a client.",
+            image_based_pages,
+        )
+        filename = "cv_ciego_REVISAR_FOTO.pdf"
+    else:
+        filename = "cv_ciego.pdf"
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "X-Cv-Redactor-Image-Based": "true" if image_based else "false",
+        "X-Cv-Redactor-Image-Pages": ",".join(str(p) for p in image_based_pages),
+        "X-Cv-Redactor-Needs-Manual-Photo-Review": "true" if image_based else "false",
+    }
     return Response(
         content=out,
         media_type="application/pdf",
-        headers={"Content-Disposition": 'inline; filename="cv_ciego.pdf"'},
+        headers=headers,
     )
