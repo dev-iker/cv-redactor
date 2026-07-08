@@ -62,16 +62,29 @@ FACE_NMS_THRESHOLD = float(os.getenv("FACE_NMS_THRESHOLD", "0.3"))
 # face lost in a huge page image is much harder for the model to find). Falls
 # back to the full image if nothing turns up in the crop.
 FACE_TOP_CROP_FRACTION = float(os.getenv("FACE_TOP_CROP_FRACTION", "0.40"))
-# Margin added around each detected face box before covering it, as a
-# multiple of the box's own width/height. Deliberately generous: the
-# detector's box is a close-but-imperfect fit (confirmed on a real CV), and
-# missing a sliver of face is a privacy leak while covering extra hair/
-# background is not. Asymmetric vertically because hair/forehead needs less
-# room than chin/neckline in most ID-style photos.
+# A detected face is just the anchor point. What actually gets covered is the
+# WHOLE photo block it sits in (background, clothing, date-stamp and all) -
+# covering only a face-sized box left the surrounding photo clearly visible,
+# which still reads as "there was a photo here". _find_photo_bbox finds that
+# block by isolating pixels that differ from the page's own background color
+# (sampled from the image's own border, see _page_background_color) and
+# taking the connected blob that contains the face. FACE_BG_DIFF_THRESHOLD is
+# the per-pixel color-distance cutoff; FACE_PHOTO_SEARCH_FRACTION is how far
+# down the page to look (a bit more than FACE_TOP_CROP_FRACTION, in case the
+# photo is taller than the face-detection crop); FACE_MIN_PHOTO_AREA_FRACTION
+# discards tiny stray components (JPEG noise, a stray mark) as not a photo.
+FACE_BG_DIFF_THRESHOLD = float(os.getenv("FACE_BG_DIFF_THRESHOLD", "30"))
+FACE_PHOTO_SEARCH_FRACTION = float(os.getenv("FACE_PHOTO_SEARCH_FRACTION", "0.50"))
+FACE_MORPH_KERNEL = int(os.getenv("FACE_MORPH_KERNEL", "15"))
+FACE_MIN_PHOTO_AREA_FRACTION = float(os.getenv("FACE_MIN_PHOTO_AREA_FRACTION", "0.005"))
+FACE_PHOTO_PAD_PX = float(os.getenv("FACE_PHOTO_PAD_PX", "3"))
+# Fallback only: if the photo block can't be isolated (unusual/non-uniform
+# background), cover a generous margin around just the face instead of
+# leaving it fully exposed. Multiple of the face box's own width/height.
 FACE_MARGIN_X = float(os.getenv("FACE_MARGIN_X", "1.15"))
 FACE_MARGIN_TOP = float(os.getenv("FACE_MARGIN_TOP", "1.2"))
 FACE_MARGIN_BOTTOM = float(os.getenv("FACE_MARGIN_BOTTOM", "1.3"))
-FACE_COVER_COLOR = (0.25, 0.28, 0.32)  # neutral slate; reads as a deliberate redaction
+FACE_COVER_COLOR = (0.25, 0.28, 0.32)  # neutral slate; only used by that fallback
 # Until this is proven reliable on enough real CVs, keep the Nivel 0 "revisar
 # a mano" warning ON even when a face was found and covered. Flip to true
 # once you trust it — then the warning only stays on for pages where NO face
@@ -80,7 +93,7 @@ TRUST_FACE_DETECTION = os.getenv("TRUST_FACE_DETECTION", "false").lower() in (
     "1", "true", "yes", "on",
 )
 
-app = FastAPI(title="CV Redactor", version="3.2.0")
+app = FastAPI(title="CV Redactor", version="3.3.0")
 
 
 def _load_keyed_png(path, opacity=1.0):
@@ -308,12 +321,69 @@ def _detect_faces_px(bgr_image):
     return [(float(f[0]), float(f[1]), float(f[2]), float(f[3])) for f in faces]
 
 
+def _page_background_color(bgr_image):
+    """Median color of a thin border strip around the image's own edges. For
+    an image-based CV the 'page' IS this image, so its true edges (top row,
+    bottom row, left/right columns) are reliably outside any photo and give
+    the real background color (typically white paper) to blend a cover into."""
+    edge = 5
+    border = np.concatenate([
+        bgr_image[:edge, :, :].reshape(-1, 3),
+        bgr_image[-edge:, :, :].reshape(-1, 3),
+        bgr_image[:, :edge, :].reshape(-1, 3),
+        bgr_image[:, -edge:, :].reshape(-1, 3),
+    ])
+    return np.median(border, axis=0)
+
+
+def _find_photo_bbox(bgr_region, anchor_x, anchor_y):
+    """Find the full rectangular photo block that contains pixel (anchor_x,
+    anchor_y) - the center of a detected face - by isolating everything that
+    differs from the region's own background color and picking the connected
+    blob covering that point. A photo is a large solid blob; text lines are
+    thin, well-separated blobs, so FACE_MIN_PHOTO_AREA_FRACTION cleanly tells
+    them apart (confirmed on a real CV: the photo blob was ~5% of the search
+    area, the largest text-line blob under 1%).
+
+    Returns ((x, y, w, h) in bgr_region's pixel coords, bg_color as BGR
+    tuple), or (None, bg_color) if no blob covering the anchor point is found.
+    """
+    img_h, img_w = bgr_region.shape[:2]
+    bg_color = _page_background_color(bgr_region)
+    diff = np.linalg.norm(
+        bgr_region.astype(np.int16) - bg_color.reshape(1, 1, 3), axis=2
+    )
+    mask = (diff > FACE_BG_DIFF_THRESHOLD).astype(np.uint8) * 255
+    kernel = np.ones((FACE_MORPH_KERNEL, FACE_MORPH_KERNEL), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    min_area = FACE_MIN_PHOTO_AREA_FRACTION * img_w * img_h
+    ax, ay = int(anchor_x), int(anchor_y)
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        if area < min_area:
+            continue
+        if x <= ax < x + w and y <= ay < y + h:
+            return (x, y, w, h), tuple(bg_color)
+    return None, tuple(bg_color)
+
+
 def _cover_faces_on_image(page, xref, img_rect):
     """Nivel 2: find and cover any face baked into a full-page background
     image (see bg_images from _remove_images). Runs 100% locally in this
     container via OpenCV/YuNet - the candidate's photo is never sent to a
     third-party service, which would otherwise make that provider a new data
     processor of the candidate's personal data.
+
+    Covers the WHOLE photo block (via _find_photo_bbox), not just a box
+    around the face - otherwise the surrounding photo (background, clothing,
+    a camera date-stamp, ...) stays visible and it still obviously reads as
+    "there was a photo here". The cover is filled with the image's own
+    background color so it blends in rather than leaving an obvious redacted
+    box. Falls back to a padded box around just the face (see FACE_MARGIN_*)
+    if the photo block can't be cleanly isolated.
 
     Returns the number of faces covered on this page.
     """
@@ -342,23 +412,45 @@ def _cover_faces_on_image(page, xref, img_rect):
     if not boxes:
         return 0
 
+    # A bit taller than the face-detection crop, in case the photo itself
+    # extends lower than the face within it (shoulders, a lanyard, etc.).
+    search_h = max(crop_h, min(img_h, int(img_h * FACE_PHOTO_SEARCH_FRACTION)))
+    search_region = bgr[:search_h, :, :]
+
     sx = img_rect.width / img_w
     sy = img_rect.height / img_h
     covered = 0
     for (x, y, w, h) in boxes:
-        fx0 = img_rect.x0 + x * sx
-        fy0 = img_rect.y0 + y * sy
-        fx1 = fx0 + w * sx
-        fy1 = fy0 + h * sy
-        fw, fh = fx1 - fx0, fy1 - fy0
-        cx, cy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
-        half_w = fw * FACE_MARGIN_X
-        half_h_top = fh * FACE_MARGIN_TOP
-        half_h_bot = fh * FACE_MARGIN_BOTTOM
-        cover = fitz.Rect(cx - half_w, cy - half_h_top, cx + half_w, cy + half_h_bot)
+        cx, cy = x + w / 2, y + h / 2
+        photo_box, bg_color = _find_photo_bbox(search_region, cx, cy)
+        if photo_box is not None:
+            px, py, pw, ph = photo_box
+            pad = FACE_PHOTO_PAD_PX
+            fx0 = img_rect.x0 + (px - pad) * sx
+            fy0 = img_rect.y0 + (py - pad) * sy
+            fx1 = img_rect.x0 + (px + pw + pad) * sx
+            fy1 = img_rect.y0 + (py + ph + pad) * sy
+            b, g, r = bg_color
+            fill = (r / 255, g / 255, b / 255)
+        else:
+            # Couldn't isolate the photo block cleanly (unusual background) -
+            # cover a generous margin around the face itself so we never
+            # leave skin visible, even if the rest of the photo remains.
+            fx0 = img_rect.x0 + x * sx
+            fy0 = img_rect.y0 + y * sy
+            fx1 = fx0 + w * sx
+            fy1 = fy0 + h * sy
+            fw, fh = fx1 - fx0, fy1 - fy0
+            ccx, ccy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
+            fx0 = ccx - fw * FACE_MARGIN_X
+            fx1 = ccx + fw * FACE_MARGIN_X
+            fy0 = ccy - fh * FACE_MARGIN_TOP
+            fy1 = ccy + fh * FACE_MARGIN_BOTTOM
+            fill = FACE_COVER_COLOR
+        cover = fitz.Rect(fx0, fy0, fx1, fy1)
         cover &= page.rect  # never draw outside the page
         if cover.get_area() > 0:
-            page.draw_rect(cover, color=FACE_COVER_COLOR, fill=FACE_COVER_COLOR, width=0)
+            page.draw_rect(cover, color=fill, fill=fill, width=0)
             covered += 1
     return covered
 
