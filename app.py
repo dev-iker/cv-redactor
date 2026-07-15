@@ -215,7 +215,11 @@ def _remove_images(page, apply_removal=True):
     bg_images = []
     for img in imgs:
         xref = img[0]
-        rects = page.get_image_rects(xref)
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception as exc:  # XObject registered as image but not a real one
+            log.warning("skipping xref %s (not a usable image): %s", xref, exc)
+            continue
         is_bg = False
         bg_rect = None
         usable = []
