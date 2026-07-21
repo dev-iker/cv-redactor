@@ -2,6 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# LibreOffice headless, usado por /convert-to-pdf para convertir CVs
+# en Word (.doc/.docx/.odt/.rtf) a PDF antes de procesarlos.
+# libreoffice-writer basta (no hace falta el paquete completo libreoffice,
+# que incluye Calc/Impress y pesa bastante más).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
+
 # PyMuPDF, Pillow and opencv-python-headless ship prebuilt wheels, so no
 # compiler/system libs should be needed. If the build ever fails on a missing
 # shared library (e.g. libglib2.0-0) for opencv, add it here with apt-get.

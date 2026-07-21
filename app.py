@@ -3,6 +3,8 @@ import io
 import json
 import logging
 import re
+import subprocess
+import tempfile
 from collections import Counter
 
 import fitz  # PyMuPDF
@@ -653,4 +655,82 @@ async def redact(
         content=out,
         media_type="application/pdf",
         headers=headers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /convert-to-pdf — convierte CVs en Word (.doc/.docx/.odt/.rtf) a PDF usando
+# LibreOffice headless, para que puedan seguir el mismo flujo que un CV que
+# ya llega en PDF. Se usa desde n8n justo después de descargar el CV original,
+# antes de "Extraer texto CV" y antes de "/redact".
+# ---------------------------------------------------------------------------
+ALLOWED_CONVERT_EXTENSIONS = {".doc", ".docx", ".odt", ".rtf"}
+
+
+@app.post("/convert-to-pdf")
+async def convert_to_pdf(
+    file: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    original_name = file.filename or "document"
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in ALLOWED_CONVERT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"extensión no soportada para conversión: {ext or '(sin extensión)'}",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, original_name)
+        with open(input_path, "wb") as f:
+            f.write(file_bytes)
+
+        try:
+            subprocess.run(
+                [
+                    "soffice", "--headless", "--norestore",
+                    "--convert-to", "pdf", "--outdir", tmpdir, input_path,
+                ],
+                capture_output=True,
+                timeout=60,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            log.error(
+                "LibreOffice conversion failed for %s: %s",
+                original_name, e.stderr.decode(errors="ignore"),
+            )
+            raise HTTPException(
+                status_code=500, detail="fallo al convertir el documento a PDF"
+            )
+        except subprocess.TimeoutExpired:
+            log.error("LibreOffice conversion timeout for %s", original_name)
+            raise HTTPException(status_code=504, detail="timeout convirtiendo a PDF")
+
+        pdf_name = os.path.splitext(original_name)[0] + ".pdf"
+        pdf_path = os.path.join(tmpdir, pdf_name)
+        if not os.path.exists(pdf_path):
+            raise HTTPException(
+                status_code=500, detail="LibreOffice no generó el PDF esperado"
+            )
+
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+    log.info(
+        "converted %s (%d bytes) to PDF (%d bytes)",
+        original_name, len(file_bytes), len(pdf_bytes),
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
     )
