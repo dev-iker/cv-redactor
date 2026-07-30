@@ -1,3 +1,4 @@
+import hashlib
 import os
 import io
 import json
@@ -5,8 +6,10 @@ import logging
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import unicodedata
-from collections import Counter
+from collections import Counter, OrderedDict
 from difflib import SequenceMatcher
 
 import fitz  # PyMuPDF
@@ -14,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageChops
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import Response, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 try:
     import cv2
@@ -61,7 +65,23 @@ ICON_PATH = os.getenv("BEHUM_ICON", os.path.join(BASE, "behum_icon.png"))
 LOGO_PATH = os.getenv("BEHUM_LOGO", os.path.join(BASE, "behum_logo.png"))
 WATERMARK_OPACITY = float(os.getenv("WATERMARK_OPACITY", "0.22"))
 WATERMARK_WIDTH = float(os.getenv("WATERMARK_WIDTH", "0.60"))   # fraction of page width
-LOGO_MAX_WIDTH = float(os.getenv("LOGO_MAX_WIDTH", "0.62"))     # fraction of page width
+# Ancho preferente del logo, en fracción del ancho de página. Antes esto era
+# LOGO_MAX_WIDTH=0.62 y en la práctica el logo SIEMPRE salía a ese tamaño: la
+# única rama que lo encogía pedía `clear_h > 20`, o sea que solo actuaba si
+# había hueco, y cuando no lo había lo dibujaba a tamaño completo encima del
+# contenido. En un CV de InfoJobs el hueco es exactamente 0 pt, porque su
+# propia marca "CV inscrito desde InfoJobs" está a 10 pt del borde.
+LOGO_WIDTH = float(os.getenv("LOGO_WIDTH", "0.30"))
+# Si al tamaño preferente el logo pisa texto, se va probando esta escalera
+# antes de cambiar de esquina o de renunciar.
+LOGO_SCALE_LADDER = tuple(float(s) for s in os.getenv(
+    "LOGO_SCALE_LADDER", "1.0,0.8,0.65,0.5").split(","))
+# Esquinas candidatas, en orden de preferencia.
+LOGO_CORNERS = tuple(c.strip() for c in os.getenv(
+    "LOGO_CORNERS", "top-right,top-left,bottom-right,bottom-left").split(","))
+LOGO_MARGIN = float(os.getenv("LOGO_MARGIN", "8"))
+# Holgura que se exige alrededor del logo para no dejarlo pegado al texto.
+LOGO_CLEARANCE = float(os.getenv("LOGO_CLEARANCE", "4"))
 
 # --- Nivel 2: face detection on image-based CVs (OpenCV YuNet, local/offline) ---
 # Runs entirely inside this container — no candidate photo is ever sent to a
@@ -146,7 +166,14 @@ OCR_PASSES = [p.strip() for p in os.getenv(
 # Pasadas usadas por /extract-text (ahí manda la calidad del texto, no la
 # recall de cajas, y una sola pasada es 3x más rápida).
 OCR_TEXT_PASSES = [p.strip() for p in os.getenv(
-    "OCR_TEXT_PASSES", "bgnorm,gray_otsu").split(",") if p.strip()]
+    "OCR_TEXT_PASSES", "bgnorm").split(",") if p.strip()]
+# n8n llama a /extract-text y después a /redact con EL MISMO PDF, así que las
+# mismas páginas se pasaban por OCR dos veces (5 pasadas en total sobre un CV
+# de 7 páginas ≈ 50 s). Se cachean las líneas por (hash del PDF, página,
+# pasada) para que la segunda llamada reutilice lo que ya leyó la primera.
+# Se guardan solo las líneas (unos KB), no las imágenes.
+OCR_CACHE_DOCS = int(os.getenv("OCR_CACHE_DOCS", "8"))
+OCR_CACHE_TTL = float(os.getenv("OCR_CACHE_TTL", "900"))  # segundos
 # Techo de páginas a pasar por OCR en una petición. Las que sobren se marcan
 # para revisión manual en vez de tumbar el worker con un PDF de 40 páginas.
 OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "20"))
@@ -173,7 +200,7 @@ OCR_DESTRUCTIVE = os.getenv("OCR_DESTRUCTIVE", "true").lower() in (
     "1", "true", "yes", "on")
 OCR_JPEG_QUALITY = int(os.getenv("OCR_JPEG_QUALITY", "88"))
 
-app = FastAPI(title="CV Redactor", version="4.0.0")
+app = FastAPI(title="CV Redactor", version="4.1.0")
 
 
 def _load_keyed_png(path, opacity=1.0):
@@ -1218,50 +1245,115 @@ def _cover_faces_on_image(page, xref, img_rect):
     return covered
 
 
-def _add_branding(page, text_top=None):
-    """Centered faint 'B' watermark + full logo placed in the top clear zone.
+def _page_text_boxes(page):
+    """Cajas de los bloques de texto reales de la página, en puntos. Es contra
+    esto contra lo que se comprueba el solape del logo."""
+    return [fitz.Rect(b[:4]) for b in page.get_text("blocks")
+            if b[6] == 0 and b[4].strip()]
 
-    text_top: y (en puntos) de la primera línea de texto de la mitad derecha.
-    En una página raster no hay bloques de texto que consultar, así que la
-    ruta de Nivel 3 lo calcula con el OCR y lo pasa aquí; si no, el logo
-    usaría el 30% de la altura por defecto y se comería la cabecera del CV.
-    """
+
+def _logo_rect(W, H, corner, w, h):
+    m = LOGO_MARGIN
+    if corner == "top-right":
+        return fitz.Rect(W - m - w, m, W - m, m + h)
+    if corner == "top-left":
+        return fitz.Rect(m, m, m + w, m + h)
+    if corner == "bottom-right":
+        return fitz.Rect(W - m - w, H - m - h, W - m, H - m)
+    if corner == "bottom-left":
+        return fitz.Rect(m, H - m - h, m + w, H - m)
+    return None
+
+
+def _logo_fits(rect, boxes):
+    probe = fitz.Rect(rect.x0 - LOGO_CLEARANCE, rect.y0 - LOGO_CLEARANCE,
+                      rect.x1 + LOGO_CLEARANCE, rect.y1 + LOGO_CLEARANCE)
+    return not any(probe.intersects(b) for b in boxes)
+
+
+def _add_watermark(page):
+    if not _WM_PNG:
+        return
     W, H = page.rect.width, page.rect.height
+    iw, ih = _WM_SIZE
+    ww = WATERMARK_WIDTH * W
+    wh = ww * ih / iw
+    page.insert_image(
+        fitz.Rect((W - ww) / 2, (H - wh) / 2, (W + ww) / 2, (H + wh) / 2),
+        stream=_WM_PNG, overlay=True, keep_proportion=True,
+    )
 
-    if _WM_PNG:
-        iw, ih = _WM_SIZE
-        ww = WATERMARK_WIDTH * W
-        wh = ww * ih / iw
-        page.insert_image(
-            fitz.Rect((W - ww) / 2, (H - wh) / 2, (W + ww) / 2, (H + wh) / 2),
-            stream=_WM_PNG, overlay=True, keep_proportion=True,
-        )
 
-    if _LOGO_PNG:
-        lw, lh = _LOGO_SIZE
-        margin = 8
-        gap = 4
-        band_x0 = 0.45 * W
-        if text_top is None:
-            blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
-            right_text = [b for b in blocks if b[2] > band_x0]
-            top_y = min((b[1] for b in right_text), default=0.30 * H)
-        else:
-            top_y = text_top
-        clear_h = max(top_y - margin - gap, 0)
-        logo_w = LOGO_MAX_WIDTH * W
-        logo_h = logo_w * lh / lw
-        if logo_h > clear_h and clear_h > 20:   # fit within the clear zone
-            logo_h = clear_h
-            logo_w = logo_h * lw / lh
-        x1 = W - margin
-        x0 = x1 - logo_w
-        y0 = margin
-        y1 = y0 + logo_h
-        page.insert_image(
-            fitz.Rect(x0, y0, x1, y1),
-            stream=_LOGO_PNG, overlay=True, keep_proportion=True,
-        )
+def _apply_branding(doc, boxes_by_page):
+    """Marca de agua en todas las páginas + logo del mismo tamaño y en la misma
+    esquina en todas ellas, garantizando que no pisa texto.
+
+    Se decide en dos fases a propósito. Primero se busca la combinación
+    (escala, esquina) que cabe en el MAYOR número de páginas del documento, y
+    solo después se dibuja. Así el logo sale igual en todo el CV: uno que
+    cambia de tamaño o de esquina de página en página se ve peor que uno
+    constante, y además hace el resultado imposible de predecir.
+
+    boxes_by_page: {índice de página: [Rect]} con las cajas de texto. En una
+    página raster no hay bloques de texto que consultar (es una imagen), así
+    que la ruta de Nivel 3 las saca de las líneas del OCR y las pasa aquí.
+    Sin eso el logo se dibujaba a ciegas encima del contenido.
+    """
+    for page in doc:
+        _add_watermark(page)
+    if not _LOGO_PNG:
+        return None
+
+    lw, lh = _LOGO_SIZE
+    n_pages = doc.page_count
+    boxes = {i: (boxes_by_page.get(i) if boxes_by_page else None)
+             for i in range(n_pages)}
+    for i in range(n_pages):
+        if boxes[i] is None:
+            boxes[i] = _page_text_boxes(doc[i])
+
+    best = None  # (nº de páginas donde cabe, escala, esquina)
+    for scale in LOGO_SCALE_LADDER:
+        for corner in LOGO_CORNERS:
+            fits = 0
+            for i in range(n_pages):
+                page = doc[i]
+                w = LOGO_WIDTH * page.rect.width * scale
+                r = _logo_rect(page.rect.width, page.rect.height, corner, w,
+                               w * lh / lw)
+                if r is not None and _logo_fits(r, boxes[i]):
+                    fits += 1
+            if best is None or fits > best[0]:
+                best = (fits, scale, corner)
+            if fits == n_pages:
+                break
+        if best and best[0] == n_pages:
+            break
+
+    fits, scale, corner = best
+    placed = 0
+    for i in range(n_pages):
+        page = doc[i]
+        W, H = page.rect.width, page.rect.height
+        w = LOGO_WIDTH * W * scale
+        r = _logo_rect(W, H, corner, w, w * lh / lw)
+        if r is None or not _logo_fits(r, boxes[i]):
+            # Esta página concreta no admite la colocación elegida: se prueban
+            # las demás esquinas al mismo tamaño antes de renunciar.
+            r = None
+            for alt in LOGO_CORNERS:
+                cand = _logo_rect(W, H, alt, w, w * lh / lw)
+                if cand is not None and _logo_fits(cand, boxes[i]):
+                    r = cand
+                    break
+        if r is None:
+            log.info("logo omitido en la página %d: no hay hueco libre", i + 1)
+            continue
+        page.insert_image(r, stream=_LOGO_PNG, overlay=True, keep_proportion=True)
+        placed += 1
+    log.info("branding: logo al %.0f%% en '%s', colocado en %d/%d página(s)",
+             scale * 100, corner, placed, n_pages)
+    return {"scale": scale, "corner": corner, "placed": placed}
 
 
 def _redaction_rects(page, term_list):
@@ -1281,6 +1373,58 @@ def _redaction_rects(page, term_list):
             if _FILLER.sub("", residual) == "":
                 rects.append(fitz.Rect(line["bbox"]))
     return rects
+# --- Caché de OCR ---------------------------------------------------------
+# Clave: (sha256 del PDF, índice de página, nombre de pasada) -> líneas.
+# Con esto /redact reutiliza lo que ya leyó /extract-text sobre el mismo
+# fichero. Además de ahorrar la mitad del OCR, garantiza que los términos que
+# detecta la IA y las cajas que se tapan salen del MISMO texto.
+_ocr_cache = OrderedDict()
+_ocr_cache_lock = threading.Lock()
+
+
+def _cache_get(doc_key, page_idx, pass_name):
+    if not doc_key:
+        return None
+    with _ocr_cache_lock:
+        entry = _ocr_cache.get(doc_key)
+        if entry is None:
+            return None
+        if time.time() - entry["t"] > OCR_CACHE_TTL:
+            _ocr_cache.pop(doc_key, None)
+            return None
+        _ocr_cache.move_to_end(doc_key)
+        return entry["pages"].get((page_idx, pass_name))
+
+
+def _cache_put(doc_key, page_idx, pass_name, lines):
+    if not doc_key:
+        return
+    with _ocr_cache_lock:
+        entry = _ocr_cache.get(doc_key)
+        if entry is None:
+            entry = {"t": time.time(), "pages": {}}
+            _ocr_cache[doc_key] = entry
+        entry["pages"][(page_idx, pass_name)] = lines
+        entry["t"] = time.time()
+        _ocr_cache.move_to_end(doc_key)
+        while len(_ocr_cache) > OCR_CACHE_DOCS:
+            _ocr_cache.popitem(last=False)
+
+
+def _ocr_lines_cached(image_u8, doc_key, page_idx, pass_name):
+    hit = _cache_get(doc_key, page_idx, pass_name)
+    if hit is not None:
+        log.info("OCR cache HIT (página %d, pasada %s)", page_idx + 1, pass_name)
+        return hit
+    lines = _ocr_lines(image_u8)
+    _cache_put(doc_key, page_idx, pass_name, lines)
+    return lines
+
+
+def _doc_key(pdf_bytes):
+    return hashlib.sha256(pdf_bytes).hexdigest() if pdf_bytes else None
+
+
 def _native_dpi(page, bg_images):
     """dpi al que conviene renderizar: el nativo de la imagen de fondo,
     acotado a [OCR_DPI_MIN, OCR_DPI_MAX]."""
@@ -1378,7 +1522,8 @@ def _strip_identifying_links(page):
     return n
 
 
-def _redact_raster_page(page, bg_images, term_list, do_faces):
+def _redact_raster_page(page, bg_images, term_list, do_faces, page_idx=0,
+                        doc_key=None):
     """Anonimiza una página que es una imagen (sin capa de texto usable).
 
     Devuelve un dict con el resultado para poder construir cabeceras y
@@ -1387,7 +1532,7 @@ def _redact_raster_page(page, bg_images, term_list, do_faces):
     res = {
         "ocr": False, "rects": 0, "faces": 0, "destructive": False,
         "unmatched": [], "partial": [], "bias": [], "kinds": [],
-        "text": "", "error": None, "right_tops": [],
+        "text": "", "error": None, "text_boxes": [],
     }
     if pytesseract is None:
         res["error"] = "pytesseract/tesseract no disponible"
@@ -1412,7 +1557,7 @@ def _redact_raster_page(page, bg_images, term_list, do_faces):
         best_text = (-1, "")
         for name, variant in _ocr_variants(rgb):
             try:
-                lines = _ocr_lines(variant)
+                lines = _ocr_lines_cached(variant, doc_key, page_idx, name)
             except Exception as e:
                 log.warning("pasada OCR '%s' falló: %s", name, e)
                 continue
@@ -1425,11 +1570,16 @@ def _redact_raster_page(page, bg_images, term_list, do_faces):
             score = sum(1 for l in lines for w in l["words"] if w["conf"] >= 60)
             if score > best_text[0]:
                 best_text = (score, "\n".join(l["text"] for l in lines))
-                # y (en puntos) de la primera línea de la mitad derecha, para
-                # que _add_branding coloque el logo sin tapar la cabecera.
+                # Cajas de las líneas en PUNTOS: es lo único que sabe dónde hay
+                # contenido en una página que es solo píxeles, y es contra esto
+                # contra lo que _apply_branding comprueba el solape del logo.
+                sx_pt = page.rect.width / W
                 sy_pt = page.rect.height / H
-                res["right_tops"] = [l["y0"] * sy_pt for l in lines
-                                     if l["x1"] > 0.45 * W]
+                res["text_boxes"] = [
+                    fitz.Rect(l["x0"] * sx_pt, l["y0"] * sy_pt,
+                              l["x1"] * sx_pt, l["y1"] * sy_pt)
+                    for l in lines
+                ]
             log.info("OCR pasada %s: %d lineas, %d rects (%s)",
                      name, len(lines), len(rects), info)
         if not unmatched_sets:
@@ -1484,7 +1634,7 @@ def _redact_raster_page(page, bg_images, term_list, do_faces):
             page.set_rotation(rot)
 
 
-def _ocr_page_text(page, bg_images):
+def _ocr_page_text(page, bg_images, page_idx=0, doc_key=None):
     """Texto OCR de una página raster, para /extract-text. Usa las pasadas de
     OCR_TEXT_PASSES y se queda con la de más palabras fiables."""
     if pytesseract is None:
@@ -1494,7 +1644,7 @@ def _ocr_page_text(page, bg_images):
     best = (-1, "")
     for name, variant in _ocr_variants(rgb, passes=OCR_TEXT_PASSES):
         try:
-            lines = _ocr_lines(variant)
+            lines = _ocr_lines_cached(variant, doc_key, page_idx, name)
         except Exception as e:
             log.warning("pasada OCR '%s' falló: %s", name, e)
             continue
@@ -1529,26 +1679,17 @@ def _open_pdf(pdf_bytes):
         raise HTTPException(status_code=400, detail="not a valid PDF")
 
 
-@app.post("/redact")
-async def redact(
-    file: UploadFile = File(...),
-    terms: str = Form(...),
-    remove_images: str = Form("true"),
-    add_branding: str = Form("true"),
-    cover_faces: str = Form("true"),
-    ocr: str = Form("true"),
-    x_api_key: str | None = Header(default=None),
-):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid api key")
-
-    term_list = _parse_terms(terms)
-    doc = _open_pdf(await file.read())
-
-    do_images = _flag(remove_images)
-    do_brand = _flag(add_branding)
-    do_faces = _flag(cover_faces)
-    do_ocr = _flag(ocr) and OCR_ENABLED and _has_tesseract()
+# ---------------------------------------------------------------------------
+# El trabajo pesado va en funciones SÍNCRONAS y los endpoints las lanzan con
+# run_in_threadpool. Antes estaba todo dentro del `async def`, y como el OCR y
+# PyMuPDF son CPU y bloquean, un CV de 7 páginas tenía el bucle de eventos
+# ocupado ~30 s: el segundo candidato que llegase esperaba el turno completo y
+# durante ese rato ni /health respondía. Con esto uvicorn atiende en paralelo
+# aunque siga con --workers 1.
+# ---------------------------------------------------------------------------
+def _do_redact(pdf_bytes, term_list, do_images, do_brand, do_faces, do_ocr):
+    doc = _open_pdf(pdf_bytes)
+    doc_key = _doc_key(pdf_bytes)
 
     total_text = 0
     total_imgs = 0
@@ -1558,7 +1699,7 @@ async def redact(
     ocr_redactions = 0
     image_based_pages = []
     pages_without_face = []   # image-based pages where 0 faces were found/covered
-    ocr_pages = []            # pages resueltas por la ruta de Nivel 3 (OCR)
+    ocr_pages = []            # páginas resueltas por la ruta de Nivel 3 (OCR)
     ocr_failed_pages = []     # raster que no se pudo anonimizar por OCR
     non_destructive_pages = []
     # Un término solo cuenta como "no localizado" si no aparece en NINGUNA
@@ -1568,6 +1709,7 @@ async def redact(
     partial_terms = set()
     bias_found = set()
     pattern_kinds = set()
+    boxes_by_page = {}        # para colocar el logo sin pisar contenido
 
     for page_idx, page in enumerate(doc):
         # 1) remove photo(s) without harming text; detect "image-based" CVs
@@ -1596,7 +1738,8 @@ async def redact(
             raster_mode = False
 
         if raster_mode:
-            res = _redact_raster_page(page, bg_images, term_list, do_faces)
+            res = _redact_raster_page(page, bg_images, term_list, do_faces,
+                                      page_idx=page_idx, doc_key=doc_key)
             if res["ocr"]:
                 ocr_pages.append(page_idx + 1)
                 ocr_redactions += res["rects"]
@@ -1605,6 +1748,7 @@ async def redact(
                 partial_terms.update(res["partial"])
                 bias_found.update(res["bias"])
                 pattern_kinds.update(res["kinds"])
+                boxes_by_page[page_idx] = res["text_boxes"]
                 if not res["destructive"]:
                     non_destructive_pages.append(page_idx + 1)
                 if res["faces"] == 0:
@@ -1614,8 +1758,6 @@ async def redact(
                           page_idx + 1, res["error"])
                 ocr_failed_pages.append(page_idx + 1)
                 pages_without_face.append(page_idx + 1)
-            if do_brand:
-                _add_branding(page, text_top=_ocr_text_top(res, page))
             continue
 
         # --- ruta de siempre: PDF con capa de texto real ---
@@ -1654,9 +1796,12 @@ async def redact(
         elif has_bg_image:
             pages_without_face.append(page_idx + 1)
 
-        # 3) Behum branding (watermark + logo)
-        if do_brand:
-            _add_branding(page)
+    # 3) Branding, en una segunda pasada sobre el documento ya anonimizado:
+    # así se puede elegir un tamaño y una esquina que valgan para TODAS las
+    # páginas, en vez de decidir a ciegas página a página.
+    brand_info = None
+    if do_brand:
+        brand_info = _apply_branding(doc, boxes_by_page)
 
     unmatched_terms = (set(term_list) - seen_terms) if ocr_pages else set()
     # Los "parciales" de un término que no se localizó en ninguna página ya
@@ -1673,6 +1818,7 @@ async def redact(
         except Exception as e:
             log.warning("no se pudieron limpiar los metadatos: %s", e)
 
+    n_pages = doc.page_count
     out = doc.tobytes(garbage=4, deflate=True, clean=True)
     doc.close()
     log.info(
@@ -1683,8 +1829,8 @@ async def redact(
         ocr_redactions, ocr_pages or "none", len(term_list),
     )
 
-    # Nivel 0 (red de seguridad RGPD). Ahora hay dos motivos independientes
-    # para pedir revisión manual y se suman:
+    # Nivel 0 (red de seguridad RGPD). Hay dos motivos independientes para
+    # pedir revisión manual y se suman:
     #   - la foto: hasta que TRUST_FACE_DETECTION=true se marca toda página
     #     basada en imagen (comportamiento de siempre, sin cambios).
     #   - el OCR: se marca SIEMPRE que algo no haya salido perfecto (un término
@@ -1733,18 +1879,36 @@ async def redact(
         "X-Cv-Redactor-Bias-Labels-Found": ",".join(sorted(bias_found))[:400],
         "X-Cv-Redactor-Pii-Kinds": ",".join(sorted(pattern_kinds)),
         "X-Cv-Redactor-Review-Pages": ",".join(str(p) for p in needs_review_pages),
+        "X-Cv-Redactor-Logo": (
+            "{}@{:.2f} en {}/{} pag".format(
+                brand_info["corner"], brand_info["scale"],
+                brand_info["placed"], n_pages)
+            if brand_info else "none"),
     }
+    return out, headers
+
+
+@app.post("/redact")
+async def redact(
+    file: UploadFile = File(...),
+    terms: str = Form(...),
+    remove_images: str = Form("true"),
+    add_branding: str = Form("true"),
+    cover_faces: str = Form("true"),
+    ocr: str = Form("true"),
+    x_api_key: str | None = Header(default=None),
+):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    term_list = _parse_terms(terms)
+    pdf_bytes = await file.read()
+    out, headers = await run_in_threadpool(
+        _do_redact, pdf_bytes, term_list,
+        _flag(remove_images), _flag(add_branding), _flag(cover_faces),
+        _flag(ocr) and OCR_ENABLED and _has_tesseract(),
+    )
     return Response(content=out, media_type="application/pdf", headers=headers)
-
-
-def _ocr_text_top(res, page):
-    """y de la primera línea de la mitad derecha, para colocar el logo sin
-    tapar la cabecera del CV. Se saca del texto OCR de la propia página."""
-    try:
-        tops = res.get("right_tops") or []
-        return min(tops) if tops else 0.14 * page.rect.height
-    except Exception:
-        return 0.14 * page.rect.height
 
 
 # ---------------------------------------------------------------------------
@@ -1753,17 +1917,9 @@ def _ocr_text_top(res, page):
 # se hacía solo con las respuestas de la entrevista. Este endpoint devuelve la
 # capa de texto si existe y, si no, el OCR de la página.
 # ---------------------------------------------------------------------------
-@app.post("/extract-text")
-async def extract_text(
-    file: UploadFile = File(...),
-    force_ocr: str = Form("false"),
-    x_api_key: str | None = Header(default=None),
-):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid api key")
-
-    doc = _open_pdf(await file.read())
-    forced = _flag(force_ocr)
+def _do_extract_text(pdf_bytes, forced):
+    doc = _open_pdf(pdf_bytes)
+    doc_key = _doc_key(pdf_bytes)
     pages = []
     sources = set()
     for page_idx, page in enumerate(doc):
@@ -1773,7 +1929,8 @@ async def extract_text(
         text, source = native, "text-layer"
         if use_ocr and OCR_ENABLED and _has_tesseract():
             if page_idx < OCR_MAX_PAGES:
-                ocr_text = _ocr_page_text(page, bg_images)
+                ocr_text = _ocr_page_text(page, bg_images, page_idx=page_idx,
+                                          doc_key=doc_key)
                 if len(ocr_text.strip()) > len(native):
                     text, source = ocr_text, "ocr"
             else:
@@ -1800,6 +1957,20 @@ async def extract_text(
     }
     log.info("extract-text: %d página(s), %d caracteres, fuentes=%s",
              len(pages), len(full), payload["source"])
+    return payload
+
+
+@app.post("/extract-text")
+async def extract_text(
+    file: UploadFile = File(...),
+    force_ocr: str = Form("false"),
+    x_api_key: str | None = Header(default=None),
+):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    pdf_bytes = await file.read()
+    payload = await run_in_threadpool(_do_extract_text, pdf_bytes, _flag(force_ocr))
     return JSONResponse(payload)
 
 
@@ -1812,26 +1983,7 @@ async def extract_text(
 ALLOWED_CONVERT_EXTENSIONS = {".doc", ".docx", ".odt", ".rtf"}
 
 
-@app.post("/convert-to-pdf")
-async def convert_to_pdf(
-    file: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None),
-):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid api key")
-
-    original_name = file.filename or "document"
-    ext = os.path.splitext(original_name)[1].lower()
-    if ext not in ALLOWED_CONVERT_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"extensión no soportada para conversión: {ext or '(sin extensión)'}",
-        )
-
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="empty file")
-
+def _do_convert_to_pdf(file_bytes, original_name):
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, original_name)
         with open(input_path, "wb") as f:
@@ -1868,6 +2020,31 @@ async def convert_to_pdf(
 
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
+    return pdf_bytes, pdf_name
+
+
+@app.post("/convert-to-pdf")
+async def convert_to_pdf(
+    file: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
+    original_name = file.filename or "document"
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in ALLOWED_CONVERT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"extensión no soportada para conversión: {ext or '(sin extensión)'}",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    pdf_bytes, pdf_name = await run_in_threadpool(
+        _do_convert_to_pdf, file_bytes, original_name)
 
     log.info(
         "converted %s (%d bytes) to PDF (%d bytes)",
