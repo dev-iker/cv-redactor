@@ -200,7 +200,7 @@ OCR_DESTRUCTIVE = os.getenv("OCR_DESTRUCTIVE", "true").lower() in (
     "1", "true", "yes", "on")
 OCR_JPEG_QUALITY = int(os.getenv("OCR_JPEG_QUALITY", "88"))
 
-app = FastAPI(title="CV Redactor", version="4.1.0")
+app = FastAPI(title="CV Redactor", version="4.1.1")
 
 
 def _load_keyed_png(path, opacity=1.0):
@@ -1312,9 +1312,17 @@ def _apply_branding(doc, boxes_by_page):
         if boxes[i] is None:
             boxes[i] = _page_text_boxes(doc[i])
 
+    # OJO con el orden de los bucles: la esquina va FUERA y la escala DENTRO,
+    # es decir "encoger antes que cambiar de esquina". Al revés (escala fuera)
+    # una esquina poco deseable a tamaño completo gana a la esquina preferida
+    # un poco más pequeña: en un CV de InfoJobs real, top-right no cabe en
+    # ninguna página (su marca "CV inscrito desde InfoJobs" está siempre ahí),
+    # top-left cabía en 5/7 al 100% y en 7/7 al 80%, y bottom-right en 7/7 al
+    # 100% — así que el logo se iba al pie en vez de encogerse un 20% y
+    # quedarse arriba.
     best = None  # (nº de páginas donde cabe, escala, esquina)
-    for scale in LOGO_SCALE_LADDER:
-        for corner in LOGO_CORNERS:
+    for corner in LOGO_CORNERS:
+        for scale in LOGO_SCALE_LADDER:
             fits = 0
             for i in range(n_pages):
                 page = doc[i]
@@ -1323,12 +1331,16 @@ def _apply_branding(doc, boxes_by_page):
                                w * lh / lw)
                 if r is not None and _logo_fits(r, boxes[i]):
                     fits += 1
+            # El `>` estricto hace que, en empate, gane la esquina que aparece
+            # antes en LOGO_CORNERS y el tamaño más grande.
             if best is None or fits > best[0]:
                 best = (fits, scale, corner)
             if fits == n_pages:
                 break
         if best and best[0] == n_pages:
             break
+        log.info("branding: '%s' descartado (cabe como mucho en %d/%d páginas)",
+                 corner, best[0] if best else 0, n_pages)
 
     fits, scale, corner = best
     placed = 0
